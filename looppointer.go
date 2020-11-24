@@ -35,7 +35,6 @@ func run(pass *analysis.Pass) (interface{}, error) {
 
 	nodeFilter := []ast.Node{
 		(*ast.RangeStmt)(nil),
-		(*ast.ForStmt)(nil),
 		(*ast.UnaryExpr)(nil),
 	}
 
@@ -78,8 +77,6 @@ func (s *Searcher) Check(n ast.Node, stack []ast.Node) (*ast.Ident, token.Pos, b
 	switch typed := n.(type) {
 	case *ast.RangeStmt:
 		s.parseRangeStmt(typed)
-	case *ast.ForStmt:
-		s.parseForStmt(typed)
 	case *ast.UnaryExpr:
 		return s.checkUnaryExpr(typed, stack)
 	}
@@ -89,19 +86,6 @@ func (s *Searcher) Check(n ast.Node, stack []ast.Node) (*ast.Ident, token.Pos, b
 func (s *Searcher) parseRangeStmt(n *ast.RangeStmt) {
 	s.addStat(n.Key)
 	s.addStat(n.Value)
-}
-
-func (s *Searcher) parseForStmt(n *ast.ForStmt) {
-	switch post := n.Post.(type) {
-	case *ast.AssignStmt:
-		// e.g. for p = head; p != nil; p = p.next
-		for _, lhs := range post.Lhs {
-			s.addStat(lhs)
-		}
-	case *ast.IncDecStmt:
-		// e.g. for i := 0; i < n; i++
-		s.addStat(post.X)
-	}
 }
 
 func (s *Searcher) addStat(expr ast.Expr) {
@@ -119,14 +103,31 @@ func insertionPosition(block *ast.BlockStmt) token.Pos {
 
 func (s *Searcher) innermostLoop(stack []ast.Node) (ast.Node, token.Pos) {
 	for i := len(stack) - 1; i >= 0; i-- {
-		switch typed := stack[i].(type) {
-		case *ast.RangeStmt:
-			return typed, insertionPosition(typed.Body)
-		case *ast.ForStmt:
+		if typed, ok := stack[i].(*ast.RangeStmt); ok {
 			return typed, insertionPosition(typed.Body)
 		}
 	}
 	return nil, token.NoPos
+}
+
+// assignStmt returns the most recent assign statement, along with the child expression
+// from the stack.
+func (s *Searcher) assignStmt(stack []ast.Node) (*ast.AssignStmt, ast.Node) {
+	for i := len(stack) - 1; i >= 0; i-- {
+		if typed, ok := stack[i].(*ast.AssignStmt); ok {
+			return typed, stack[i+1]
+		}
+	}
+	return nil, nil
+}
+
+func (s *Searcher) callExpr(stack []ast.Node) *ast.CallExpr {
+	for i := len(stack) - 1; i >= 0; i-- {
+		if typed, ok := stack[i].(*ast.CallExpr); ok {
+			return typed
+		}
+	}
+	return nil
 }
 
 func (s *Searcher) checkUnaryExpr(n *ast.UnaryExpr, stack []ast.Node) (*ast.Ident, token.Pos, bool) {
@@ -148,6 +149,24 @@ func (s *Searcher) checkUnaryExpr(n *ast.UnaryExpr, stack []ast.Node) (*ast.Iden
 	// If the identity is not the loop statement variable,
 	// it will not be reported.
 	if _, isStat := s.Stats[id.Obj.Pos()]; !isStat {
+		return nil, token.NoPos, true
+	}
+
+	// If the identity is not used in an assignment or call expression, it
+	// will not be reported.
+	assignStmt, child := s.assignStmt(stack)
+	callExpr := s.callExpr(stack)
+	if assignStmt == nil && callExpr == nil {
+		return nil, token.NoPos, true
+	}
+
+	// If an identity is used in an assignStmt, it must be on the right-hand side of the '='
+	if assignStmt != nil {
+		for _, expr := range assignStmt.Rhs {
+			if expr == child {
+				return id, insert, false
+			}
+		}
 		return nil, token.NoPos, true
 	}
 
